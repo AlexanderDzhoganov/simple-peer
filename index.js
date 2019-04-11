@@ -34,8 +34,11 @@ function Peer (opts) {
     ? opts.channelName || randombytes(20).toString('hex')
     : null
 
+  self.unreliableChannelName = opts.initiator
+    ? opts.unreliableChannelName || randombytes(20).toString('hex')
+    : null
+
   self.initiator = opts.initiator || false
-  self.channelConfig = opts.channelConfig || Peer.channelConfig
   self.config = Object.assign({}, Peer.config, opts.config)
   self.offerOptions = opts.offerOptions || {}
   self.answerOptions = opts.answerOptions || {}
@@ -69,9 +72,11 @@ function Peer (opts) {
 
   self._pcReady = false
   self._channelReady = false
+  self._unreliableChannelReady = false
   self._iceComplete = false // ice candidate trickle done (got null candidate)
   self._iceCompleteTimer = null // send an offer/answer anyway after some timeout
   self._channel = null
+  self._unreliableChannel = null
   self._pendingCandidates = []
 
   self._isNegotiating = !self.initiator // is this peer waiting for negotiation to complete?
@@ -119,12 +124,14 @@ function Peer (opts) {
   // - onnegotiationneeded
 
   if (self.initiator) {
-    self._setupData({
-      channel: self._pc.createDataChannel(self.channelName, self.channelConfig)
-    })
+    const channel = self._pc.createDataChannel(self.channelName, { ordered: true })
+    self._setupData(channel)
+
+    const unreliableChannel = self._pc.createDataChannel(self.unreliableChannelName, { ordered: false, maxRetransmits: 0 })
+    self._setupData(unreliableChannel)
   } else {
     self._pc.ondatachannel = function (event) {
-      self._setupData(event)
+      self._setupData(event.channel)
     }
   }
 
@@ -165,7 +172,6 @@ Peer.config = {
   ],
   sdpSemantics: 'unified-plan'
 }
-Peer.channelConfig = {}
 
 Object.defineProperty(Peer.prototype, 'bufferSize', {
   get: function () {
@@ -237,10 +243,16 @@ Peer.prototype._addIceCandidate = function (candidate) {
 /**
  * Send text/binary data to the remote peer.
  * @param {ArrayBufferView|ArrayBuffer|Buffer|string|Blob} chunk
+ * @param {Boolean} unreliable
  */
-Peer.prototype.send = function (chunk) {
+Peer.prototype.send = function (chunk, unreliable) {
   var self = this
-  self._channel.send(chunk)
+
+  if (unreliable && self._unreliableChannelReady) {
+    self._unreliableChannel.send(chunk)
+  } else {
+    self._channel.send(chunk)
+  }
 }
 
 /**
@@ -457,6 +469,18 @@ Peer.prototype._destroy = function (err, cb) {
     self._channel.onclose = null
     self._channel.onerror = null
   }
+
+  if (self._unreliableChannel) {
+    try {
+      self._unreliableChannel.close()
+    } catch (err) {}
+
+    self._unreliableChannel.onmessage = null
+    self._unreliableChannel.onopen = null
+    self._unreliableChannel.onclose = null
+    self._unreliableChannel.onerror = null
+  }
+
   if (self._pc) {
     try {
       self._pc.close()
@@ -471,52 +495,68 @@ Peer.prototype._destroy = function (err, cb) {
   }
   self._pc = null
   self._channel = null
+  self._unreliableChannel = null
 
   if (err) self.emit('error', err)
   self.emit('close')
   cb()
 }
 
-Peer.prototype._setupData = function (event) {
+Peer.prototype._setupData = function (channel) {
   var self = this
-  if (!event.channel) {
+  if (!channel) {
     // In some situations `pc.createDataChannel()` returns `undefined` (in wrtc),
     // which is invalid behavior. Handle it gracefully.
     // See: https://github.com/feross/simple-peer/issues/163
-    return self.destroy(makeError('Data channel event is missing `channel` property', 'ERR_DATA_CHANNEL'))
+    return self.destroy(makeError('Data channel is null', 'ERR_DATA_CHANNEL'))
   }
 
-  self._channel = event.channel
-  self._channel.binaryType = 'arraybuffer'
+  const unreliable = !channel.ordered
 
-  if (typeof self._channel.bufferedAmountLowThreshold === 'number') {
-    self._channel.bufferedAmountLowThreshold = MAX_BUFFERED_AMOUNT
+  if (unreliable) {
+    self._unreliableChannel = channel
+  } else {
+    self._channel = channel
   }
 
-  self.channelName = self._channel.label
+  channel.binaryType = 'arraybuffer'
 
-  self._channel.onmessage = function (event) {
+  if (typeof channel.bufferedAmountLowThreshold === 'number') {
+    channel.bufferedAmountLowThreshold = MAX_BUFFERED_AMOUNT
+  }
+
+  if (unreliable) {
+    self.unreliableChannelName = channel.label
+  } else {
+    self.channelName = channel.label
+  }
+
+  channel.onmessage = function (event) {
     self._onChannelMessage(event)
   }
-  self._channel.onbufferedamountlow = function () {
-    self._onChannelBufferedAmountLow()
+
+  if (!unreliable) {
+    channel.onbufferedamountlow = function () {
+      self._onChannelBufferedAmountLow()
+    }
   }
-  self._channel.onopen = function () {
-    self._onChannelOpen()
+
+  channel.onopen = function () {
+    self._onChannelOpen(unreliable)
   }
-  self._channel.onclose = function () {
-    self._onChannelClose()
+  channel.onclose = function () {
+    self._onChannelClose(unreliable)
   }
-  self._channel.onerror = function (err) {
-    self.destroy(makeError(err, 'ERR_DATA_CHANNEL'))
+  channel.onerror = function (err) {
+    self.destroy(makeError(err, unreliable ? 'ERR_DATA_UNRELIABLE_CHANNEL' : 'ERR_DATA_CHANNEL'))
   }
 
   // HACK: Chrome will sometimes get stuck in readyState "closing", let's check for this condition
   // https://bugs.chromium.org/p/chromium/issues/detail?id=882743
   var isClosing = false
   self._closingInterval = setInterval(function () { // No "onclosing" event
-    if (self._channel && self._channel.readyState === 'closing') {
-      if (isClosing) self._onChannelClose() // closing timed out: equivalent to onclose firing
+    if (channel && channel.readyState === 'closing') {
+      if (isClosing) self._onChannelClose(unreliable) // closing timed out: equivalent to onclose firing
       isClosing = true
     } else {
       isClosing = false
@@ -962,17 +1002,29 @@ Peer.prototype._onChannelBufferedAmountLow = function () {
   cb(null)
 }
 
-Peer.prototype._onChannelOpen = function () {
+Peer.prototype._onChannelOpen = function (unreliable) {
   var self = this
   if (self.connected || self.destroyed) return
   self._debug('on channel open')
-  self._channelReady = true
-  self._maybeReady()
+
+  if (unreliable) {
+    self._unreliableChannelReady = true
+  } else {
+    self._channelReady = true
+    self._maybeReady()
+  }
 }
 
-Peer.prototype._onChannelClose = function () {
+Peer.prototype._onChannelClose = function (unreliable) {
   var self = this
   if (self.destroyed) return
+
+  if (unreliable) {
+    self._debug('on unreliable channel close')
+    self._unreliableChannelReady = false
+    return
+  }
+
   self._debug('on channel close')
   self.destroy()
 }
